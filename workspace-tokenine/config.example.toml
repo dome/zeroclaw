@@ -1,0 +1,84 @@
+# Tokenine Bot Configuration for ZeroClaw
+# Copy this file to ~/.zeroclaw/config.toml or use ZEROCLAW_WORKSPACE env
+
+# ── Provider Configuration ─────────────────────────────────────
+default_provider = "anthropic"
+default_model = "claude-sonnet-4"
+api_key = "${ANTHROPIC_API_KEY}"
+
+# ── Agent Settings ─────────────────────────────────────────────
+[agent]
+max_tool_iterations = 10
+default_temperature = 0.7
+
+# ── Autonomy & Security ────────────────────────────────────────
+[autonomy]
+level = "supervised"
+auto_approve = ["memory_recall", "memory_remember", "read_file"]
+always_ask = ["shell", "http_request"]
+
+# ── Delegate Tool Configuration ────────────────────────────────
+[delegate]
+timeout_secs = 120
+agentic_timeout_secs = 300
+
+# ── Delegate Agents (Sub-agents) ───────────────────────────────
+[agents.coupon_validator]
+provider = "anthropic"
+model = "claude-sonnet-4"
+system_prompt = """You are the Coupon Validator Agent.
+Your ONLY job is to validate coupon codes and register them.
+NEVER talk to customers directly.
+ALWAYS validate before registering.
+Return results in JSON format only."""
+agentic = false
+allowed_tools = ["shell", "http_request"]
+timeout_secs = 60
+
+# ── Hooks Configuration ────────────────────────────────────────
+[hooks]
+
+[hooks.coupon_guardrail]
+enabled = true
+code_pattern = "^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$"
+require_validation = true
+validation_agent = "coupon_validator"
+blocked_patterns = [
+    "TEST.*",
+    "FAKE.*",
+    "DEMO.*",
+    "AAAA.*",
+    "0000.*",
+    "1234.*",
+]
+guarded_tools = [
+    "apply_coupon",
+    "checkout",
+    "place_order",
+    "register_coupon",
+    "redeem_coupon",
+]
+
+# ── Channel Configuration (Facebook) ───────────────────────────
+# Uncomment and configure when ready to deploy
+# [channels_config.facebook]
+# enabled = true
+# page_id = "${FACEBOOK_PAGE_ID}"
+# access_token = "${FACEBOOK_ACCESS_TOKEN}"
+# verify_token = "${FACEBOOK_VERIFY_TOKEN}"
+# app_secret = "${FACEBOOK_APP_SECRET}"
+
+# ── Memory Configuration ───────────────────────────────────────
+[memory]
+backend = "sqlite"
+namespace = "tokenine"
+
+# ── Gateway Configuration ──────────────────────────────────────
+[gateway]
+host = "127.0.0.1"
+port = 8080
+enabled = true
+
+# ── Logging ────────────────────────────────────────────────────
+[observability]
+log_level = "info"

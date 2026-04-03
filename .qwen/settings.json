@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zeroclaw *)",
+      "Bash(tail *)",
+      "Bash(journalctl *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(sleep *)",
+      "Bash(cargo build *)",
+      "Bash(./target/release/zeroclaw *)",
+      "Bash(xargs *)",
+      "Bash(curl *)",
+      "Bash(pkill *)",
+      "Bash(jq *)",
+      "Bash(sqlite3 *)",
+      "Bash(file *)",
+      "Bash(database *)",
+      "Bash(python3 *)",
+      "Bash(git checkout *)",
+      "Bash(git remote *)"
+    ]
+  },
+  "$version": 3
+}

@@ -59,6 +59,7 @@ pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
+pub mod facebook;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -66,6 +67,7 @@ pub mod whatsapp_storage;
 pub mod whatsapp_web;
 
 pub use bluesky::BlueskyChannel;
+pub use facebook::FacebookChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -4686,6 +4688,35 @@ fn collect_configured_channels(
                 .with_proxy_url(sig.proxy_url.clone()),
             ),
         });
+    }
+
+    if let Some(ref fb) = config.channels_config.facebook {
+        if fb.access_token.is_some() && fb.page_id.is_some() && fb.verify_token.is_some() {
+            // Skip channel listener if gateway_only mode is enabled
+            if !fb.gateway_only {
+                channels.push(ConfiguredChannel {
+                    display_name: "Facebook Messenger",
+                    channel: Arc::new(
+                        FacebookChannel::new(
+                            fb.access_token.clone().unwrap_or_default(),
+                            fb.page_id.clone().unwrap_or_default(),
+                            fb.verify_token.clone().unwrap_or_default(),
+                            fb.allowed_senders.clone(),
+                        )
+                        .with_proxy_url(fb.proxy_url.clone())
+                        .with_dm_mention_patterns(fb.dm_mention_patterns.clone())
+                        .with_group_mention_patterns(fb.group_mention_patterns.clone()),
+                    ),
+                });
+                tracing::info!("✅ Facebook Messenger channel initialized");
+            } else {
+                tracing::info!("✅ Facebook configured in gateway-only mode (webhook endpoints enabled)");
+            }
+        } else {
+            tracing::warn!(
+                "Facebook configured but missing required fields (access_token, page_id, verify_token)"
+            );
+        }
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {

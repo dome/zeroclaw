@@ -5182,6 +5182,13 @@ pub struct BuiltinHooksConfig {
     /// that matches one of `tool_patterns`.
     #[serde(default)]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the coupon-guardrail hook.
+    ///
+    /// Validates coupon codes before allowing registration/checkout operations.
+    /// Provides multi-layer protection: format validation, blocked patterns,
+    /// and sub-agent delegation for separation of concerns.
+    #[serde(default)]
+    pub coupon_guardrail: crate::hooks::builtin::CouponGuardrailConfig,
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -6116,6 +6123,8 @@ pub struct ChannelsConfig {
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
     pub signal: Option<SignalConfig>,
+    /// Facebook Messenger channel configuration.
+    pub facebook: Option<FacebookConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
@@ -6227,6 +6236,10 @@ impl ChannelsConfig {
                 self.signal.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.facebook.as_ref())),
+                self.facebook.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.whatsapp.as_ref())),
                 self.whatsapp.is_some(),
             ),
@@ -6334,6 +6347,7 @@ impl Default for ChannelsConfig {
             imessage: None,
             matrix: None,
             signal: None,
+            facebook: None,
             whatsapp: None,
             linq: None,
             wati: None,
@@ -6791,6 +6805,41 @@ pub enum WhatsAppChatPolicy {
     All,
 }
 
+/// Facebook Messenger channel configuration (Meta Graph API for Pages).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FacebookConfig {
+    /// Page access token from Meta Business Suite
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Facebook Page ID
+    #[serde(default)]
+    pub page_id: Option<String>,
+    /// Webhook verify token (you define this, Meta sends it back for verification)
+    #[serde(default)]
+    pub verify_token: Option<String>,
+    /// App secret from Meta Business Suite (for webhook signature verification)
+    /// Can also be set via `ZEROCLAW_FACEBOOK_APP_SECRET` environment variable
+    #[serde(default)]
+    pub app_secret: Option<String>,
+    /// Allowed sender PSIDs or "*" for all
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    /// Mention patterns for direct messages
+    #[serde(default)]
+    pub dm_mention_patterns: Vec<String>,
+    /// Mention patterns for group chats
+    #[serde(default)]
+    pub group_mention_patterns: Vec<String>,
+    /// Custom proxy URL for this channel
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// If true, only use Facebook for gateway webhook processing (no channel listener).
+    /// This avoids the "listener exited unexpectedly" error while still enabling
+    /// Facebook message handling via /webhook or /facebook-webhook endpoints.
+    #[serde(default)]
+    pub gateway_only: bool,
+}
+
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
@@ -6865,6 +6914,15 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+}
+
+impl ChannelConfig for FacebookConfig {
+    fn name() -> &'static str {
+        "Facebook"
+    }
+    fn desc() -> &'static str {
+        "Messenger Graph API"
+    }
 }
 
 impl ChannelConfig for WhatsAppConfig {

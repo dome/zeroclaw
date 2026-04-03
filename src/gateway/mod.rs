@@ -23,7 +23,7 @@ pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
+    Channel, FacebookChannel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
     WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
@@ -337,6 +337,9 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    pub facebook: Option<Arc<FacebookChannel>>,
+    /// `Facebook` app secret for webhook signature verification (`X-Hub-Signature-256`)
+    pub facebook_app_secret: Option<Arc<str>>,
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
@@ -561,6 +564,45 @@ pub async fn run_gateway(
             })
         });
 
+    // Facebook channel (if configured)
+    // Note: We create the Facebook channel object even in gateway_only mode
+    // so that webhook endpoints can process Facebook messages.
+    let facebook_channel: Option<Arc<FacebookChannel>> = config
+        .channels_config
+        .facebook
+        .as_ref()
+        .filter(|fb| fb.access_token.is_some() && fb.page_id.is_some() && fb.verify_token.is_some())
+        .map(|fb| {
+            Arc::new(FacebookChannel::new(
+                fb.access_token.clone().unwrap_or_default(),
+                fb.page_id.clone().unwrap_or_default(),
+                fb.verify_token.clone().unwrap_or_default(),
+                fb.allowed_senders.clone(),
+            )
+            .with_proxy_url(fb.proxy_url.clone())
+            .with_dm_mention_patterns(fb.dm_mention_patterns.clone())
+            .with_group_mention_patterns(fb.group_mention_patterns.clone()))
+        });
+
+    // Facebook app secret for webhook signature verification
+    // Priority: environment variable > config file
+    let facebook_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_FACEBOOK_APP_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.facebook.as_ref().and_then(|fb| {
+                fb.app_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
+
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels_config
@@ -774,6 +816,10 @@ pub async fn run_gateway(
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
+    if facebook_channel.is_some() {
+        println!("  GET  {pfx}/facebook-webhook  — Meta webhook verification");
+        println!("  POST {pfx}/facebook-webhook  — Facebook Messenger message webhook");
+    }
     if whatsapp_channel.is_some() {
         println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
         println!("  POST {pfx}/whatsapp  — WhatsApp message webhook");
@@ -848,6 +894,8 @@ pub async fn run_gateway(
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        facebook: facebook_channel,
+        facebook_app_secret,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
@@ -910,6 +958,8 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        .route("/facebook-webhook", get(handle_facebook_verify))
+        .route("/facebook-webhook", post(handle_facebook_message))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -1343,7 +1393,7 @@ async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
@@ -1399,8 +1449,128 @@ async fn handle_webhook(
         }
     }
 
-    // ── Parse body ──
-    let Json(webhook_body) = match body {
+    // ── First parse JSON as generic value ──
+    let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Webhook JSON parse error: {e}");
+            let err = serde_json::json!({
+                "error": "Invalid JSON body"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // ── Detect Facebook Webhook payload ──
+    if payload.get("object").and_then(|v| v.as_str()) == Some("page") && payload.get("entry").is_some() {
+        if let Some(ref fb) = state.facebook {
+            tracing::debug!("Detected Facebook webhook payload on /webhook endpoint");
+            
+            // Verify signature if app secret is configured
+            if let Some(ref secret) = state.facebook_app_secret {
+                if let Some(sig) = headers.get("X-Hub-Signature-256").and_then(|v| v.to_str().ok()) {
+                    if !verify_meta_signature(secret.as_ref(), &body, sig) {
+                        tracing::warn!("Facebook webhook signature verification failed");
+                        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid signature"})));
+                    }
+                }
+            }
+
+            let messages = fb.parse_webhook_payload(&payload);
+
+            if messages.is_empty() {
+                return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+            }
+
+            // Process each message
+            for msg in &messages {
+                tracing::info!(
+                    "Facebook message from {}: {}",
+                    msg.sender,
+                    truncate_with_ellipsis(&msg.content, 50)
+                );
+                let session_id = sender_session_id("facebook", msg);
+
+                // Auto-save to memory
+                if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
+                    let key = format!("facebook:{}:{}", msg.sender, msg.timestamp);
+                    let _ = state
+                        .mem
+                        .store(
+                            &key,
+                            &msg.content,
+                            MemoryCategory::Conversation,
+                            Some(&session_id),
+                        )
+                        .await;
+                }
+
+                // Spawn background task to process message
+                let state_clone = state.clone();
+                let msg_clone = msg.clone();
+                let fb_clone = fb.clone();
+                tokio::spawn(async move {
+                    match run_gateway_chat_with_tools(
+                        &state_clone,
+                        &msg_clone.content,
+                        Some(&session_id),
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let _ = fb_clone.send(&SendMessage::new(response, &msg_clone.reply_target)).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("LLM error for Facebook message: {e:#}");
+                        }
+                    }
+                });
+            }
+
+            // Always return 200 OK to Meta immediately
+            return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        }
+    }
+
+    // ── First check if this is Facebook Messenger webhook payload ──
+    if payload.get("object").and_then(|v| v.as_str()) == Some("page") && payload.get("entry").is_some() {
+        tracing::info!("✅ Facebook Messenger webhook payload detected on /webhook endpoint");
+        
+        if let Some(fb) = state.facebook.as_ref() {
+            let messages = fb.parse_webhook_payload(&payload);
+            for msg in messages {
+                let session_id = format!("facebook:{}", msg.sender);
+                tracing::info!("Facebook message received from PSID: {}", msg.sender);
+                
+                // Spawn background task to process message
+                let state_clone = state.clone();
+                let msg_clone = msg.clone();
+                let fb_clone = fb.clone();
+                tokio::spawn(async move {
+                    match run_gateway_chat_with_tools(
+                        &state_clone,
+                        &msg_clone.content,
+                        Some(&session_id),
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let _ = fb_clone.send(&SendMessage::new(response, &msg_clone.reply_target)).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("LLM error for Facebook message: {e:#}");
+                        }
+                    }
+                });
+            }
+        }
+
+        // Always return 200 OK to Meta immediately
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // ── Parse body as standard webhook format ──
+    let webhook_body = match serde_json::from_value::<WebhookBody>(payload) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("Webhook JSON parse error: {e}");
@@ -1541,7 +1711,7 @@ async fn handle_webhook(
 
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
-pub struct WhatsAppVerifyQuery {
+pub struct MetaWebhookVerifyQuery {
     #[serde(rename = "hub.mode")]
     pub mode: Option<String>,
     #[serde(rename = "hub.verify_token")]
@@ -1550,10 +1720,131 @@ pub struct WhatsAppVerifyQuery {
     pub challenge: Option<String>,
 }
 
+/// Alias for backward compatibility
+pub use MetaWebhookVerifyQuery as WhatsAppVerifyQuery;
+
+/// POST /facebook-webhook — incoming message webhook
+async fn handle_facebook_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref fb) = state.facebook else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Facebook not configured"})),
+        );
+    };
+
+    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
+    if let Some(ref app_secret) = state.facebook_app_secret {
+        let signature = headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !verify_meta_signature(app_secret, &body, signature) {
+            tracing::warn!(
+                "Facebook webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = fb.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        // Acknowledge the webhook even if no messages (could be status updates)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "Facebook message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+        let session_id = sender_session_id("facebook", msg);
+
+        // Auto-save to memory
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
+            let key = format!("facebook:{}:{}", msg.sender, msg.timestamp);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
+        }
+
+        // Spawn background task to process message
+        let state_clone = state.clone();
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            let _ = run_gateway_chat_with_tools(
+                &state_clone,
+                &msg_clone.content,
+                Some(&session_id),
+            )
+            .await;
+        });
+    }
+
+    // Always return 200 OK to Meta immediately
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// GET /facebook-webhook — Meta webhook verification
+async fn handle_facebook_verify(
+    State(state): State<AppState>,
+    Query(params): Query<MetaWebhookVerifyQuery>,
+) -> impl IntoResponse {
+    let Some(ref fb) = state.facebook else {
+        return (StatusCode::NOT_FOUND, "Facebook not configured".to_string());
+    };
+
+    // Verify the token matches (constant-time comparison to prevent timing attacks)
+    let token_matches = params
+        .verify_token
+        .as_deref()
+        .is_some_and(|t| constant_time_eq(t, fb.verify_token()));
+    if params.mode.as_deref() == Some("subscribe") && token_matches {
+        if let Some(ch) = params.challenge {
+            tracing::info!("Facebook webhook verified successfully");
+            return (StatusCode::OK, ch);
+        }
+        return (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string());
+    }
+
+    tracing::warn!("Facebook webhook verification failed — token mismatch");
+    (StatusCode::FORBIDDEN, "Forbidden".to_string())
+}
+
 /// GET /whatsapp — Meta webhook verification
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
-    Query(params): Query<WhatsAppVerifyQuery>,
+    Query(params): Query<MetaWebhookVerifyQuery>,
 ) -> impl IntoResponse {
     let Some(ref wa) = state.whatsapp else {
         return (StatusCode::NOT_FOUND, "WhatsApp not configured".to_string());
@@ -1579,7 +1870,7 @@ async fn handle_whatsapp_verify(
 /// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
 /// Returns true if the signature is valid, false otherwise.
 /// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
-pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
+pub fn verify_meta_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -1602,6 +1893,9 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
     // Constant-time comparison
     mac.verify_slice(&expected).is_ok()
 }
+
+/// Alias for backward compatibility
+pub use verify_meta_signature as verify_whatsapp_signature;
 
 /// POST /whatsapp — incoming message webhook
 async fn handle_whatsapp_message(
@@ -2339,6 +2633,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            facebook: None,
+            facebook_app_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
